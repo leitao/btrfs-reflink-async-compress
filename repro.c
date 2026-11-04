@@ -1,26 +1,37 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Reproduce btrfs going read-only after a transaction abort (-EUCLEAN) in
+ * Reproduce btrfs going read-only after a transaction abort in
  * btrfs_unpin_extent_cache(), caused by a reflink racing with async
  * compressed writeback of the range it replaces.
  *
  * Every iteration dirties blocks 1-2 (sent to async compression) and block 5
- * (written right away) of one multi-block folio, reflinks block 0 onto block 1
- * with copy_file_range() and reads block 1 back.  On an unfixed kernel the
- * reflink does not wait for the async extent, so one of these happens:
+ * of one multi-block folio, reflinks block 0 onto block 1 with
+ * copy_file_range() and reads block 1 back.  Block 5 is a single block, which
+ * is written right away since v7.0 (and with -o compress when it does not
+ * compress).  Its writeback clears the folio's dirty tag, so on an unfixed
+ * kernel the reflink does not wait for the async extent and one of these
+ * happens:
  *
  *  - the transaction aborts and the filesystem is forced read-only,
  *  - block 1 reads back the overwritten data instead of the cloned data,
  *  - with INLINE_SRC=1, copy_inline_to_page() deadlocks against the worker.
  *
- * Needs a btrfs with 4K blocks mounted with compress-force.  With pages of 32K
- * or more the blocks share a page.  With smaller pages (4K, 16K) each iteration
- * truncates the file and rewrites its first 32K, so that they share a large
- * folio (btrfs uses large folios by default since v7.2).
+ * Before v7.0, block 5 is a second async extent instead.  CLONE_BLOCK=5 with
+ * PRE_WRITEBACK=500 reflinks onto it right after starting writeback, which
+ * catches the window where blocks 1-2 have finished writeback and block 5 has
+ * no ordered extent yet.
+ *
+ * Needs a btrfs with 4K blocks mounted with compress or compress-force.  With
+ * pages of 32K or more the blocks share a page.  With smaller pages (4K, 16K)
+ * each iteration truncates the file and rewrites its first 32K, so that they
+ * share a large folio (btrfs uses large folios by default since v7.2).
  *
  * Usage: repro <file> [iterations]
- *   INLINE_SRC=1   clone from an inline extent (64K pages only)
- *   LARGE_FOLIO=0|1 override the large folio mode picked from the page size
+ *   INLINE_SRC=1      clone from an inline extent (64K pages only)
+ *   LARGE_FOLIO=0|1   override the large folio mode picked from the page size
+ *   CLONE_BLOCK=n     reflink block 0 onto block n instead of block 1
+ *   PRE_WRITEBACK=us  start writeback before the reflink, then sleep up to us
+ *   LONE_RANDOM=1     fill block 5 with random bytes, which do not compress
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -39,14 +50,23 @@ static void fill(char *b, size_t n, unsigned int seed)
 		b[i] = (char)('a' + (seed + i / 512) % 26);
 }
 
+static int env_int(const char *name, int def)
+{
+	const char *v = getenv(name);
+
+	return v && *v ? atoi(v) : def;
+}
+
 int main(int argc, char **argv)
 {
 	const char *path = argc > 1 ? argv[1] : "f";
 	long iters = argc > 2 ? atol(argv[2]) : 100000000;
 	char a[BS], b[2 * BS], c[BS], r[BS], big[8 * BS];
-	const char *env = getenv("LARGE_FOLIO");
-	int large = env ? atoi(env) : sysconf(_SC_PAGESIZE) < 8 * BS;
-	int inline_src = getenv("INLINE_SRC") != NULL;
+	int large = env_int("LARGE_FOLIO", sysconf(_SC_PAGESIZE) < 8 * BS);
+	int inline_src = env_int("INLINE_SRC", 0);
+	int cblk = env_int("CLONE_BLOCK", 1);
+	int pre_wb = env_int("PRE_WRITEBACK", 0);
+	int lone_random = env_int("LONE_RANDOM", 0);
 	long mismatches = 0;
 	int fd, fd_ro;
 	ssize_t ret;
@@ -56,8 +76,15 @@ int main(int argc, char **argv)
 		fprintf(stderr, "INLINE_SRC needs pages of 32K or more\n");
 		return 2;
 	}
-	printf("mode: %s source, %s\n", inline_src ? "inline" : "regular",
-	       large ? "32K large folio rebuilt every iteration" : "one page");
+	if (cblk < 1 || cblk > 7) {
+		fprintf(stderr, "CLONE_BLOCK must be between 1 and 7\n");
+		return 2;
+	}
+	printf("mode: %s source, %s, clone onto block %d%s%s\n",
+	       inline_src ? "inline" : "regular",
+	       large ? "32K large folio rebuilt every iteration" : "one page",
+	       cblk, pre_wb ? ", writeback started first" : "",
+	       lone_random ? ", random block 5" : "");
 
 	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0) {
@@ -84,7 +111,7 @@ int main(int argc, char **argv)
 	}
 
 	for (long i = 0; i < iters; i++) {
-		loff_t off_in = 0, off_out = BS;
+		loff_t off_in = 0, off_out = (loff_t)cblk * BS;
 
 		if (i % 200 == 0)
 			printf("iter %ld t=%ld mismatches %ld\n", i,
@@ -103,11 +130,19 @@ int main(int argc, char **argv)
 			printf("iter %ld: pwrite: %s\n", i, strerror(errno));
 			break;
 		}
-		/* A lone block [20K, 24K) of the same folio: written right away. */
+		/* A lone block [20K, 24K) of the same folio. */
 		fill(c, sizeof(c), 7);
+		if (lone_random)
+			for (int k = 0; k < BS; k++)
+				c[k] = random();
 		if (pwrite(fd, c, BS, 5 * BS) != BS) {
 			printf("iter %ld: pwrite: %s\n", i, strerror(errno));
 			break;
+		}
+		/* Start writeback first, as the flusher would. */
+		if (pre_wb) {
+			sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
+			usleep(random() % pre_wb);
 		}
 		ret = copy_file_range(fd_ro, &off_in, fd, &off_out, BS, 0);
 		if (ret != BS) {
@@ -115,13 +150,13 @@ int main(int argc, char **argv)
 			       ret, strerror(errno));
 			break;
 		}
-		if (pread(fd, r, BS, BS) != BS) {
+		if (pread(fd, r, BS, (off_t)cblk * BS) != BS) {
 			printf("iter %ld: pread: %s\n", i, strerror(errno));
 			break;
 		}
 		if (memcmp(r, a, BS) && mismatches++ < 5)
-			printf("iter %ld: STALE READ: [4K, 8K) holds '%c', not the cloned '%c'\n",
-			       i, r[0], a[0]);
+			printf("iter %ld: STALE READ: block %d holds '%c', not the cloned '%c'\n",
+			       i, cblk, r[0], a[0]);
 	}
 	printf("done, mismatches %ld\n", mismatches);
 	return mismatches ? 1 : 0;

@@ -1,10 +1,11 @@
 #!/bin/sh
 # Guest side of run.sh, runs inside the virtme-ng guest.  It mounts the test
-# disk with compress-force, runs the reproducer, watches for the filesystem
+# disk with compression, runs the reproducer, watches for the filesystem
 # going read-only, stale reads or a hang, writes the verdict to result.txt and
 # powers off.
 #
-# Environment: MODE=clone|inline|stress-ng  RUNTIME=<s>  COPIES=<n>  DELAYS=0|1
+# Environment: MODE=clone|late|compress|inline|stress-ng  RUNTIME=<s>
+#              COPIES=<n>  DELAYS=0|1
 
 D=$(dirname "$(readlink -f "$0")")
 MODE=${MODE:-clone}
@@ -25,17 +26,37 @@ finish() {
 	sleep 30
 }
 
+MOUNT_OPTS=compress-force=zstd:3
+DELAY_BT=delay.bt
+case $MODE in
+late)
+	# Reflink onto the second async extent of the folio, right after
+	# starting writeback (hits before v7.0 too).
+	export CLONE_BLOCK=5 PRE_WRITEBACK=500
+	DELAY_BT=delay-late.bt
+	;;
+compress)
+	# The heuristic of -o compress sends the random block 5 to a write
+	# right away, as compress-force does for any single block since v7.0.
+	MOUNT_OPTS=compress=zstd:3
+	export LONE_RANDOM=1
+	;;
+inline)
+	export INLINE_SRC=1
+	;;
+esac
+
 say "kernel: $(uname -r)"
-say "page size: $(getconf PAGESIZE), mode: $MODE, copies: $COPIES, runtime: ${RUNTIME}s"
+say "page size: $(getconf PAGESIZE), mode: $MODE, copies: $COPIES, runtime: ${RUNTIME}s, mount: $MOUNT_OPTS"
 
 DEV=$(for b in /sys/block/vd* /sys/block/sd*; do [ -e "$b" ] && echo "/dev/${b##*/}"; done | head -1)
 mkdir -p "$D/mnt"
-if ! mount -o compress-force=zstd:3 "$DEV" "$D/mnt"; then
+if ! mount -o "$MOUNT_OPTS" "$DEV" "$D/mnt"; then
 	finish ERROR "cannot mount $DEV as btrfs (CONFIG_BTRFS_FS?)"
 fi
 
 if [ "${DELAYS:-0}" = 1 ]; then
-	bpftrace "$D/delay.bt" > "$D/bpftrace.out" 2>&1 &
+	bpftrace "$D/$DELAY_BT" > "$D/bpftrace.out" 2>&1 &
 	for i in $(seq 1 60); do
 		grep -q -E 'Attached|ERROR' "$D/bpftrace.out" 2>/dev/null && break
 		sleep 1
@@ -48,7 +69,6 @@ if [ "$MODE" = stress-ng ]; then
 	stress-ng --fd-abuse "$COPIES" --temp-path "$D/mnt" -t "$RUNTIME" > "$D/stress-ng.out" 2>&1 &
 	PIDS=$!
 else
-	[ "$MODE" = inline ] && export INLINE_SRC=1
 	for n in $(seq 1 "$COPIES"); do
 		taskset -c $(((n - 1) % $(nproc))) "$D/repro" "$D/mnt/f$n" > "$D/repro$n.out" 2>&1 &
 		PIDS="$PIDS $!"
@@ -64,7 +84,7 @@ idle=0
 while [ $t -lt "$deadline" ]; do
 	sleep 2
 	t=$((t + 2))
-	if dmesg | grep -q -E 'unexpected start offset .* when unpinning|forced readonly'; then
+	if dmesg | grep -q -E 'when unpinning extent range|forced readonly'; then
 		sleep 2
 		hit="filesystem forced read-only (transaction abort) after ${t}s"
 		break
@@ -105,7 +125,7 @@ else
 	done
 fi
 say "---- kernel log ----"
-dmesg | grep -E 'WARNING|unexpected start offset|aborted|forced readonly|blocked for more' | head -12 | tee -a "$R"
+dmesg | grep -E 'WARNING|when unpinning|aborted|forced readonly|blocked for more' | head -12 | tee -a "$R"
 dmesg | sed -n '/cut here/,/end trace/p' | head -40 >> "$R"
 if [ -s "$D/stacks.txt" ]; then
 	say "---- stacks of the stuck reproducers ----"

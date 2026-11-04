@@ -15,11 +15,14 @@ KEEP=0
 
 usage() {
 	cat <<EOF
-usage: $0 [-k kernel] [-m clone|inline|stress-ng] [-t seconds] [-n copies] [-c cpus] [-d] [-K]
+usage: $0 [-k kernel] [-m mode] [-t seconds] [-n copies] [-c cpus] [-d] [-K]
   -k  kernel tree or image to boot (default: current directory)
-  -m  clone: reproducer (default); inline: clone from an inline extent, which
-      deadlocks instead (pages of 32K or more); stress-ng: stress-ng --fd-abuse,
-      which hits the same race
+  -m  clone: reproducer, compress-force, v7.0 or later (default);
+      late: reflink onto the second async extent of the folio, compress-force,
+      v6.16 to v6.19; compress: -o compress with an incompressible block,
+      v6.16 or later; inline: clone from an inline extent, which deadlocks
+      instead (pages of 32K or more); stress-ng: stress-ng --fd-abuse, which
+      hits the same race
   -t  give up after this many seconds (default: $RUNTIME)
   -n  copies of the reproducer (default: 4), or stress-ng instances
       (default: one per guest CPU)
@@ -42,7 +45,7 @@ while getopts k:m:t:n:c:dKh opt; do
 	*) usage ;;
 	esac
 done
-case $MODE in clone|inline|stress-ng) ;; *) usage ;; esac
+case $MODE in clone|late|compress|inline|stress-ng) ;; *) usage ;; esac
 if [ -z "$COPIES" ]; then
 	[ "$MODE" = stress-ng ] && COPIES=$CPUS || COPIES=4
 fi
@@ -56,7 +59,7 @@ done
 KERNEL=$(readlink -f "$KERNEL")
 
 WORK=$(mktemp -d /tmp/btrfs-reflink-repro.XXXXXX)
-cp "$HERE/guest.sh" "$HERE/delay.bt" "$WORK/"
+cp "$HERE/guest.sh" "$HERE/delay.bt" "$HERE/delay-late.bt" "$WORK/"
 gcc -O2 -Wall -o "$WORK/repro" "$HERE/repro.c" || exit 2
 truncate -s 8G "$WORK/disk.img"
 mkfs.btrfs -q -f -s 4096 "$WORK/disk.img" || exit 2

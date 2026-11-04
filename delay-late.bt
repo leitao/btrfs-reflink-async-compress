@@ -1,0 +1,28 @@
+// Optional (run.sh -m late -d): widen the race with busy-wait delays.
+// 1) delay the async worker's ordered extent creation by a random amount, so
+//    the second async extent of the folio comes late;
+// 2) pause the reflink between its ordered extent wait and its extent lock,
+//    so that late extent's pinned extent map exists when btrfs_clone() drops
+//    the range, which aborts the transaction instead of losing data.
+kprobe:submit_compressed_extents
+{
+	$t = nsecs + (rand % 600000);
+	for ($i : 0..4000000) {
+		if (nsecs > $t) { break; }
+	}
+	@sce = count();
+}
+
+kretprobe:btrfs_wait_ordered_range /comm == "repro"/
+{
+	$t = nsecs + (rand % 400000);
+	for ($i : 0..3000000) {
+		if (nsecs > $t) { break; }
+	}
+	@wor = count();
+}
+
+interval:s:20
+{
+	print(@sce); print(@wor);
+}

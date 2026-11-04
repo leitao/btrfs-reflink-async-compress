@@ -1,0 +1,125 @@
+From 855435e7b6c9c4ea83189fca70d7eb7e15afbb8c Mon Sep 17 00:00:00 2001
+From: Breno Leitao <leitao@debian.org>
+Date: Wed, 4 Nov 2026 04:15:52 -0800
+Subject: [PATCH 6.16] btrfs: wait for pending async extents in
+ btrfs_fdatawrite_range()
+
+btrfs_fdatawrite_range() calls filemap_fdatawrite_range() a second time
+when the inode has async extents. The second call is supposed to block
+on the folio lock, which an async extent holds until its ordered extent
+exists. That only works while the folio is still tagged dirty, and a
+folio with more than one block can lose its tag early:
+
+1) Writeback of a folio sends a delalloc range of two or more blocks to
+   async compression, and another range of the same folio starts
+   writeback first: a range written right away, such as a lone block,
+   which is never compressed, or another async extent submitted before
+   it. The async range keeps the folio locked.
+2) The async worker clears the dirty bits of its range in
+   compress_file_range().
+3) The other range starts writeback. The folio now has no dirty block,
+   so btrfs_subpage_set_writeback() clears PAGECACHE_TAG_DIRTY and
+   PAGECACHE_TAG_TOWRITE.
+
+The second filemap_fdatawrite_range() then skips the folio, and
+btrfs_wait_ordered_range() returns before the async extent has an
+ordered extent. Before commit 095be159f3eb ("btrfs: unify folio dirty
+flag clearing"), extent_write_cache_pages() cleared the folio dirty flag
+up front, so step 3 dropped the tags even without step 2.
+
+stress-ng --fd-abuse hit this on a 64K page arm64 host with 4K blocks
+and compress-force, and it also reproduces with 4K pages when the file
+has large folios. stress-ng reflinks a file onto itself with
+copy_file_range(fd, 0, fd, 4096, 4096) while writing to it, so the clone
+races with the async extent of the range it replaces:
+
+- If the async extent is first, btrfs_clone() splits its pinned extent
+  map, and finishing the ordered extent aborts the transaction:
+
+  [   11.244461] WARNING: fs/btrfs/extent_map.c:443 at btrfs_unpin_extent_cache+0x150/0x230, CPU#4: kworker/u32:1/15
+  [   11.244536] BTRFS warning (device vda): found extent map for inode 258 (root 5) with unexpected start offset 8192 when unpinning extent range [4096, 12288), generation 7
+  [   11.244585] BTRFS error (device vda state A): Transaction 7 aborted (-EUCLEAN)
+
+  When the clone covers the whole extent, its extent map is dropped
+  instead, and the abort is -ENOENT with "no extent map found for inode
+  ... when unpinning extent range". 64K page arm64 hosts running
+  6.16-based kernels with compress-force hit that through two async
+  extents in one folio.
+- If the clone is first, the compressed write lands after it and
+  silently replaces the cloned data.
+- If the clone source is inline, copy_inline_to_page() waits on the
+  folio lock while holding the extent lock the async worker needs to
+  create its ordered extent, and both hang.
+
+Fix it by locking the folios of any delalloc left in the range after
+the second filemap_fdatawrite_range(). An async extent keeps its range
+delalloc and its folios locked until its ordered extent is created, so
+this waits for it like the second call was meant to.
+
+Fixes: 1d2fbb7f1f9e ("btrfs: allow compression even if the range is not page aligned")
+Closes: https://lore.kernel.org/all/ause7k_HjzUWT3D-@gmail.com/
+[ backport to v6.16: open-code folio_next_pos(), which is new in v6.19 ]
+Signed-off-by: Breno Leitao <leitao@debian.org>
+---
+ fs/btrfs/file.c | 37 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 8ce6f45f45e0bb..9bd6b638878b93 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -3780,6 +3780,37 @@ const struct file_operations btrfs_file_operations = {
+ 	.fop_flags	= FOP_BUFFER_RASYNC | FOP_BUFFER_WASYNC,
+ };
+ 
++/*
++ * A folio with several blocks can lose its dirty tag before an async extent in
++ * it has an ordered extent, so wait on the folios of any delalloc that is left.
++ */
++static void wait_delalloc_folios(struct btrfs_inode *inode, u64 start, u64 end)
++{
++	u64 found_start;
++	u64 found_end;
++
++	while (start <= end) {
++		struct folio *folio;
++
++		if (!btrfs_find_first_extent_bit(&inode->io_tree, start,
++						 &found_start, &found_end,
++						 EXTENT_DELALLOC, NULL) ||
++		    found_start > end)
++			break;
++
++		start = max(start, found_start);
++		folio = filemap_lock_folio(inode->vfs_inode.i_mapping,
++					   start >> PAGE_SHIFT);
++		if (IS_ERR(folio)) {
++			start = round_down(start, PAGE_SIZE) + PAGE_SIZE;
++			continue;
++		}
++		start = folio_pos(folio) + folio_size(folio);
++		folio_unlock(folio);
++		folio_put(folio);
++	}
++}
++
+ int btrfs_fdatawrite_range(struct btrfs_inode *inode, loff_t start, loff_t end)
+ {
+ 	struct address_space *mapping = inode->vfs_inode.i_mapping;
+@@ -3800,8 +3831,12 @@ int btrfs_fdatawrite_range(struct btrfs_inode *inode, loff_t start, loff_t end)
+ 	 * right and you are wrong.
+ 	 */
+ 	ret = filemap_fdatawrite_range(mapping, start, end);
+-	if (!ret && test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT, &inode->runtime_flags))
++	if (!ret &&
++	    test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT, &inode->runtime_flags)) {
+ 		ret = filemap_fdatawrite_range(mapping, start, end);
++		if (!ret)
++			wait_delalloc_folios(inode, start, end);
++	}
+ 
+ 	return ret;
+ }
+-- 
+2.53.0-Meta
+
