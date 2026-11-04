@@ -1,0 +1,26 @@
+// Optional (run.sh -d): widen the race with busy-wait delays.
+// 1) let the async compression worker clear the dirty bits of its range
+//    before the writeback thread submits the lone block of the same folio;
+// 2) delay the async worker's ordered extent creation by a random amount.
+kprobe:extent_writepage_io /comm == "repro"/
+{
+	$t = nsecs + 150000;
+	for ($i : 0..2000000) {
+		if (nsecs > $t) { break; }
+	}
+	@wpio = count();
+}
+
+kprobe:submit_compressed_extents
+{
+	$t = nsecs + (rand % 600000);
+	for ($i : 0..4000000) {
+		if (nsecs > $t) { break; }
+	}
+	@sce = count();
+}
+
+interval:s:20
+{
+	print(@wpio); print(@sce);
+}
